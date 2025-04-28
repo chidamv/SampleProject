@@ -1,0 +1,214 @@
+# This Python 3 environment comes with many helpful analytics libraries installed
+# It is defined by the kaggle/python Docker image: https://github.com/kaggle/docker-python
+# For example, here's several helpful packages to load
+
+import numpy as np # linear algebra
+import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
+
+# Input data files are available in the read-only "../input/" directory
+# For example, running this (by clicking run or pressing Shift+Enter) will list all files under the input directory
+
+import os
+for dirname, _, filenames in os.walk('/kaggle/input'):
+    for filename in filenames:
+        print(os.path.join(dirname, filename))
+
+# You can write up to 20GB to the current directory (/kaggle/working/) that gets preserved as output when you create a version using "Save & Run All" 
+# You can also write temporary files to /kaggle/temp/, but they won't be saved outside of the current session
+#Install Dask if needed
+!pip install dask[complete] --quiet
+#
+import dask.dataframe as dd
+import pandas as pd
+import numpy as np
+import logging
+import sys
+import os
+import time
+import glob
+from dask.diagnostics import ProgressBar
+#
+logging.basicConfig( level=logging.INFO,format="%(asctime)s - %(levelname)s - %(message)s")
+
+PRICE_TMP_DIR = "tmp_price"
+VOLUME_TMP_DIR = "tmp_volume"
+FINAL_PRICE_PATH = "final_price.parquet"
+FINAL_VOLUME_PATH = "final_volume.parquet"
+RETURNS_PATH = "returns.parquet"
+STOCK_COLS = [f"stk_{i:03d}" for i in range(1, 201)]
+MAX_RETRIES = 3
+#
+os.makedirs(PRICE_TMP_DIR, exist_ok=True)
+os.makedirs(VOLUME_TMP_DIR, exist_ok=True)
+#
+def read_csv_with_retry(filepath):
+    """Retry logic is here for reading large CSVs."""
+    for attempt in range(1, MAX_RETRIES+1):
+        try:
+            df = dd.read_csv(filepath, assume_missing=True, dtype={
+                "id": "int32",
+                "price": "float32",
+                "trade_volume": "int64"
+            })
+            logging.info(f"Successfully read {filepath}")
+            return df
+        except Exception as e:
+            logging.error(f" Error reading {filepath}: {e}, Attempt {attempt}")
+            time.sleep(2)
+    raise Exception(f"Failed to read {filepath} after {MAX_RETRIES} retries")
+#
+def process_csv(df, chunk_id, file):
+    """Process a CSV file: pivot and save price/volume separately."""
+    try:
+        # Convert 'stk_id' to category dtype
+        df.columns = df.columns.str.strip()
+
+        if 'stk_id' not in df.columns:
+            logging.warning(f"Skipping file due to missing 'stk_id' column: {file}")
+            return # Skip this file   if 'stk_id' is missing
+            
+        df['stk_id'] = df['stk_id'].astype('category')
+        
+        # Use map_partitions to convert 'date' to datetime in each partition
+        df['date'] = df.map_partitions(lambda df: pd.to_datetime(df['date'], format='%Y-%m-%d'))
+     
+        # Pivot
+        price_df = df.pivot_table(index='date', columns='stk_id', values='price', aggfunc='last')
+        volume_df = df.pivot_table(index='date', columns='stk_id', values='trade_volume', aggfunc='last')
+
+        # Making sure column names follow the format 'stk_001', 'stk_002', etc
+        price_df.columns = [f"stk_{str(col).zfill(3)}" for col in price_df.columns]
+        volume_df.columns = [f"stk_{str(col).zfill(3)}" for col in volume_df.columns]
+        
+        # Ensure all stocks present
+        price_df = price_df.reindex(columns=STOCK_COLS)
+        volume_df = volume_df.reindex(columns=STOCK_COLS)
+
+         # Ensure output folders exist
+        os.makedirs(PRICE_TMP_DIR, exist_ok=True)
+        os.makedirs(VOLUME_TMP_DIR, exist_ok=True)
+
+        # Save to parquet
+        price_output_file = os.path.join(PRICE_TMP_DIR, f"price_{chunk_id:03d}.parquet")
+        volume_output_file = os.path.join(VOLUME_TMP_DIR, f"volume_{chunk_id:03d}.parquet")
+
+        price_df.to_parquet(price_output_file)
+        volume_df.to_parquet(volume_output_file)
+
+        logging.info(f" Processed and saved chunk {chunk_id}")
+    except Exception as e:
+        logging.error(f" Error processing chunk {chunk_id}: {e}")
+        raise e
+#
+def validate_parquet_folder(folder):
+    """Ensure temp folder has parquet files."""
+    
+    if not os.path.exists(folder):
+        raise RuntimeError(f" Folder {folder} does not exist.")
+        
+    files = glob.glob(f"{folder}/*.parquet")
+
+    if not files:
+        logging.warning(f" No parquet files found in {folder}. Files in folder: {os.listdir(folder)}. Check if CSVs were loaded properly.")
+    else:
+        logging.info(f" Validation passed: {len(files)} files found in {folder}")
+   #
+def combine_and_save(tmp_dir, output_path):
+    """Combine all parquets into a single file."""
+    try:
+        if not glob.glob(f"{tmp_dir}/*.parquet"):
+            logging.warning(f" No parquet files found in {tmp_dir}. Skipping combine.")
+            return
+
+        df = dd.read_parquet(tmp_dir)
+        df = df.groupby(df.index).last().compute()
+        df = df.sort_index()
+        df.to_parquet(output_path, index=True)
+        logging.info(f" Combined and saved to {output_path}")
+    except Exception as e:
+        logging.error(f" Failed to combine parquet files: {e}")
+        raise e
+#
+def calculate_returns(price_file, output_file):
+    """Calculate stock returns."""
+    try:
+        if not os.path.exists(price_file):
+            logging.warning(f" Skipping returns calculation: {price_file} does not exist.")
+            return
+
+        prices = dd.read_parquet(price_file)
+        returns = prices.pct_change().dropna()
+        returns.compute().to_parquet(output_file, compression='snappy')
+        logging.info(f"  Returns calculated and saved to {output_file}")
+    except Exception as e:
+        logging.error(f"  Failed to calculate returns: {e}")
+        raise e
+#
+def cleanup():
+    """Remove temp files."""
+    import shutil
+    shutil.rmtree(PRICE_TMP_DIR, ignore_errors=True)
+    shutil.rmtree(VOLUME_TMP_DIR, ignore_errors=True)
+    logging.info("  Cleaned up temp folders")
+#
+def create_mock_csv():
+    """Create a sample CSV if no data exists."""
+    np.random.seed(42)
+    dates = pd.date_range(start="2022-01-01", periods=5)
+    ids = np.arange(1, 6)  # 5 stocks
+    rows = []
+    for date in dates:
+        for stock_id in ids:
+            rows.append({
+                "date": date.strftime('%Y-%m-%d'),
+                "id": stock_id,
+                "price": np.round(np.random.uniform(100, 200), 2),
+                "trade_volume": np.random.randint(1000, 10000)
+            })
+    df_sample = pd.DataFrame(rows)
+    df_sample.to_csv("mock_data.csv", index=False)
+    print(" Mock CSV data generated.")
+
+# Generate mock CSV if none exists
+if not glob.glob("*.csv"):
+    create_mock_csv()
+#
+# Main ETL
+def run_etl():
+    """Main ETL runner."""
+    try:
+        logging.info("🚀 ETL Process Started")
+        csv_files = glob.glob("*.csv")
+        if not glob.glob("*.csv"):
+           create_mock_csv()
+        if not csv_files:
+           print(" No CSV files found to process. Please upload CSV files first.")
+           return  # <-- Don't crash. Just return cleanly.
+        chunk_id = 0
+        for file in sorted(glob.glob("*.csv")):
+            logging.info(f"📄 Processing file: {file}")
+            df = read_csv_with_retry(file)
+            process_csv(df, chunk_id, file)
+            chunk_id += 1
+
+        validate_parquet_folder(PRICE_TMP_DIR)
+        validate_parquet_folder(VOLUME_TMP_DIR)
+
+        combine_and_save(PRICE_TMP_DIR, FINAL_PRICE_PATH)
+        combine_and_save(VOLUME_TMP_DIR, FINAL_VOLUME_PATH)
+
+        if os.path.exists(FINAL_PRICE_PATH):
+           calculate_returns(FINAL_PRICE_PATH, RETURNS_PATH)
+        else:
+           logging.warning(f" Skipping returns: {FINAL_PRICE_PATH} not found.")
+      
+
+        cleanup()
+
+        logging.info("🎯 ETL Process Completed Successfully")
+    except Exception as e:
+        logging.error(f" ETL Process Failed: {e}")
+        raise e
+#
+if __name__ == "__main__":
+    run_etl()
